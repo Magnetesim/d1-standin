@@ -82,7 +82,9 @@ TYPE_MM_RESPONSE = 0x002B
 # BAP connection to that address (sibling d1-bap activity_host.rs; BE is the order that connected).
 TYPE_AH_PROXY_REQUEST = 0x0010
 TYPE_AH_PROXY_RESPONSE = 0x0011
-PEER_ADDR_REPLY = False   # --bap-peer-addr-reply: answer 0x12c with a bare OK (run public12c: WEASEL 0.25 s later [U cause])
+PEER_ADDR_REPLY = False   # legacy --bap-peer-addr-reply: bare 0x12d OK (run public12c: WEASEL [U cause])
+PEER_ADDR_MODE = "off"    # --bap-12c-reply: off | ok | peer | echo
+PEER_ADDR36 = None        # 36-byte bdCommonAddr used by mode "peer"
 AH_PROXY = ("127.0.0.1", 3074)   # --bap-ah-proxy IP:PORT
 CLIENT_CONFIG_RESPONSE_BODY = bytes.fromhex("08001000")
 
@@ -352,8 +354,16 @@ def reply_for(pt: bytes, account_soid: int, body_503: bytes | None = None) -> by
         return struct.pack(">HIH", TYPE_SUBSCRIPTION_RESPONSE, seq, STATUS_OK)
     if t == TYPE_UNSUBSCRIBE_REQUEST:
         return struct.pack(">HIH", TYPE_UNSUBSCRIBE_RESPONSE, seq, STATUS_OK)
-    if t == 0x012C and PEER_ADDR_REPLY:   # public AH: {u16 36, bdCommonAddr of the peer, u16}; reply modelled on 0x12e -> 0x12f [U]
-        return struct.pack(">HIH", 0x012D, seq, STATUS_OK)
+    if t == 0x012C:   # public AH external/NAT introduction (journal public12b..12d)
+        mode = PEER_ADDR_MODE if PEER_ADDR_MODE != "off" else ("ok" if PEER_ADDR_REPLY else "off")
+        if mode == "ok":
+            return struct.pack(">HIH", 0x012D, seq, STATUS_OK)
+        if mode == "peer" and PEER_ADDR36 is not None and len(PEER_ADDR36) == 36 and len(body) >= 40:
+            # mirror setup 0x12e: u16 36 | peer bdCommonAddr | u16 tail from the request
+            return (struct.pack(">HIH", 0x012D, seq, STATUS_OK)
+                    + struct.pack(">H", 36) + PEER_ADDR36 + body[38:40])
+        if mode == "echo" and len(body) >= 40:
+            return struct.pack(">HIH", 0x012D, seq, STATUS_OK) + body[:40]
     if t == TYPE_AH_PROXY_REQUEST and len(body) >= 8:
         import socket as _s
         ip, port = AH_PROXY

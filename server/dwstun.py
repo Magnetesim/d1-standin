@@ -32,6 +32,7 @@ without guessing at a BAP response; UDP STUN behavior is unchanged.
 """
 import argparse
 import json
+import os
 import subprocess
 import selectors
 import socket
@@ -57,6 +58,12 @@ def log(msg: str) -> None:
 
 def hx(b: bytes) -> str:
     return " ".join(f"{c:02X}" for c in b)
+
+
+def bd_common_addr(ip: str, port: int) -> bytes:
+    """36-byte bdCommonAddr used by the peer/0x12e address fields (same shape as the client)."""
+    ep = socket.inet_aton(ip) + struct.pack("<H", port)
+    return ep + bytes.fromhex("00ff00ff0000") * 2 + ep + ep + b"\x02" + bytes(5)
 
 
 # --- 2.x (2.3.1.1) reply -------------------------------------------------------------------
@@ -193,7 +200,9 @@ def main() -> int:
     ap.add_argument("--social-activities", default="", metavar="INDEX,...",
                     help="activity indices (max 5) given a matchmaking group limit through an engine-config delta in the "
                          "0x0013 reply; --social-delta-file = the SignOn reply body whose f4.3 delta is repeated")
-    ap.add_argument("--social-delta-file", default="config/signon-reply.bin")
+    ap.add_argument("--social-delta-file",
+                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "signon-reply.bin"),
+                    help="SignOn reply body whose f4.3 delta is repeated (default: config/signon-reply.bin beside the server)")
     ap.add_argument("--mm-tuning", default="", metavar="FIELD=VALUE,...",
                     help="matchmaking configuration tuning values (0x002b f4.1 varint fields 1..9), e.g. 4=0xffffffff")
     ap.add_argument("--bap-profile-dense", default="", metavar="SUB,...",
@@ -230,7 +239,12 @@ def main() -> int:
                     "the spawn gate also accepts 6)")
     ap.add_argument("--ah-sensor-delay", type=float, default=None, help="seconds after the 2nd state refresh (6)")
     ap.add_argument("--ah-start", default=None, help="udt 1 initial region REGION[,SPAWNHASH]")
-    ap.add_argument("--bap-peer-addr-reply", action="store_true", help="answer BAP 0x12c with 0x12d OK")
+    ap.add_argument("--bap-peer-addr-reply", action="store_true", help="answer BAP 0x12c with 0x12d OK (legacy, known WEASEL)")
+    ap.add_argument("--bap-12c-reply", choices=["off", "ok", "peer", "echo"], default="off",
+                    help="public-AH 0x12c introduction: off (silence, default), ok (bare status; known WEASEL), "
+                         "peer (0x12d with the peer bdCommonAddr, 40-byte body), echo (echo the request's 40-byte body)")
+    ap.add_argument("--bap-12c-addr", default=None, metavar="IP:PORT",
+                    help="address used by --bap-12c-reply peer (default: <primary>:3074, the public-AH blob address)")
     ap.add_argument("--peer-connect", default="R,I,0,O", help="connect-response u32 fields: I = the request's [4] "
                     "(the client's channel id), R = its [0], O = ours (0x5AFE), or numbers; empty = no reply")
     ap.add_argument("--peer-membership", default="", help="after the join-request send a membership-update probe "
@@ -360,6 +374,16 @@ def main() -> int:
         bap_channel.ART_DYES = bool(args.bap_art_dyes)
         bap_channel.ITEM_GRIDS = args.bap_item_grids
         bap_channel.DYE_CLASS_FILTER = args.bap_art_dyes == "class"
+        bap_channel.PEER_ADDR_MODE = args.bap_12c_reply
+        if args.bap_peer_addr_reply and bap_channel.PEER_ADDR_MODE == "off":
+            bap_channel.PEER_ADDR_MODE = "ok"
+        if args.bap_12c_reply == "peer":
+            addr = args.bap_12c_addr or f"{args.primary}:3074"
+            ip, port = addr.rsplit(":", 1)
+            bap_channel.PEER_ADDR36 = bd_common_addr(ip, int(port))
+            log(f"0x12c reply: peer bdCommonAddr {ip}:{port} {bap_channel.PEER_ADDR36.hex()}")
+        else:
+            log(f"0x12c reply mode: {bap_channel.PEER_ADDR_MODE}")
     bap_pending = {}
     ah_sessions = {}
 

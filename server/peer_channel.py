@@ -4,7 +4,7 @@ Framing inside the application payload (after the LE16 N prefix of dtls_peer): p
 size of the message struct, then the bit-packed body; a clear bit ends the list. Registered message types: 4 connect-request (44), 5 connect-response (52),
 6 connect-refuse (12), 7 connect-establish (8), 8 connect-closed (12); 9 = join-request (2856), 12 seen with the
 security id + a nonce [U name]. connect-request = u32, u32, 36 raw bytes (secure address);
-connect-response = u32 x4, 36 raw bytes."""
+connect-response = u32 x4, 36 raw bytes (registration 0x8c8ab4, encoder 0x8c8d18; exactly 52 bytes)."""
 import struct
 
 NAMES = {0: "ping", 1: "pong", 4: "connect-request", 5: "connect-response", 6: "connect-refuse", 7: "connect-establish",
@@ -40,7 +40,18 @@ def connect_request(app: bytes):
 
 
 def connect_response(fields, address36: bytes) -> bytes:
-    msg = b"\xC5" + struct.pack(">H", 52) + struct.pack(">4I", *fields) + address36 + b"\0"
+    """Message 5: four u32 fields followed by the 36-byte secure address.
+
+    The binary encoder 0x8c8d18 writes 4 x 32 bits + 0x120 bits = 52 bytes, and the
+    registration at 0x8c8ab4 declares size 52. The payload is therefore exactly 52
+    bytes; an extra trailing NUL made this 53/56/58 and disagreed with ``describe``.
+    """
+    if len(fields) != 4:
+        raise ValueError(f"connect-response needs 4 u32 fields, got {len(fields)}")
+    if len(address36) != 36:
+        raise ValueError(f"connect-response address must be 36 bytes, got {len(address36)}")
+    payload = struct.pack(">4I", *fields) + address36
+    msg = b"\xC5" + struct.pack(">H", len(payload)) + payload
     return struct.pack("<H", len(msg)) + msg
 
 
