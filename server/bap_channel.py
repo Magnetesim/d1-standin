@@ -1,6 +1,6 @@
 """BAP secure channel (envelope mode 1) for the local stand-in.
 
-Every key here is server-chosen (see PROJECT_LOG.md 2026-09-27 "BAP channel layer decrypted"):
+Every key here is server-chosen:
 
 * The setup-phase type-0x1a reply carries a sealed record ``u32be L || iv16 || ct || hmac32``
   (AES-128-CBC with ``conn+0x2261``, HMAC-SHA256 with ``conn+0x2271``; both come from our SignOn
@@ -13,6 +13,7 @@ Every key here is server-chosen (see PROJECT_LOG.md 2026-09-27 "BAP channel laye
 """
 from __future__ import annotations
 
+import os
 import struct
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -56,6 +57,37 @@ INVESTMENT_206_NO_SPAN = b"\x10"
 # investment_701_response_body). 701 is sent after Screen Bounds / brightness; unanswered it is
 # retried and the client shows "Contacting Destiny Servers".
 INVESTMENT_ZERO_COMPOSITE_IDS = {104, 502, 504, 505, 506, 701, 702}
+# Display settings (Screen Bounds, brightness, subtitles...): investment 701 commits the account's field 5
+# (0x80801716, 1088 B; the 48-byte tail 0x808017D6 holds the values) whenever the client's copy differs from the
+# served account (tick 0x2aabcc memcmps it). Captured here and served back as account field 5, the first-run screens
+# are skipped on the next sign-in. SETTINGS_FILE persists the raw argument bits.
+SETTINGS = {"account5": None}
+SETTINGS_FILE = None
+# Character select: account field 3 (the profile SOID) makes the client pre-select the character and continue
+# (0x2afeec). AUTOSELECT = False leaves it out so the select screen waits.
+AUTOSELECT = True
+SELECTED = {"done": False}   # set by investment 504 (character selected) when AUTOSELECT is off
+INVESTMENT_504 = 504   # select character: args = presence + u8 + u64 character SOID + u8
+
+
+def load_settings(path):
+    """Read a settings file written by save_settings (missing file = nothing stored yet)."""
+    import json, os, rsat
+    global SETTINGS_FILE
+    SETTINGS_FILE = path
+    if path and os.path.exists(path):
+        raw = bytes.fromhex(json.load(open(path))["account5"])
+        SETTINGS["account5"] = rsat.decode(0x80801716, raw)[0]
+
+
+def store_settings_701(args_bits: bytes):
+    import json, rsat
+    SETTINGS["account5"] = rsat.decode(0x80801716, args_bits)[0]
+    if SETTINGS_FILE:
+        with open(SETTINGS_FILE, "w") as fh:
+            json.dump({"account5": args_bits.hex()}, fh)
+
+
 INVESTMENT_402 = 402   # dismantle: args = presence bit + u64 item SOID + tail; answered with the result composite
 INVESTMENT_403 = 403   # inventory_equip_item: args = u64 item SOID + u8; answered with the result composite
 INVESTMENT_801 = 801   # talent node select: args = u64 item SOID + i8 node (biased, 0x86 = 6) [U] + pad
@@ -404,16 +436,32 @@ def reply_for(pt: bytes, account_soid: int, body_503: bytes | None = None) -> by
                 CHARACTERS.append(NEW_CHARACTER_SOID)
             CHARACTER_IDENTITY[NEW_CHARACTER_SOID] = identity_from_501(body[2:])
             CHARACTER_CREATION[NEW_CHARACTER_SOID] = bytes(body[2:])   # replayed as identity + customization
+            # creating a character also selects it: the account delta that follows must carry field 3 (the
+            # profile), or the creation screen's Finish does nothing (no-autoselect left it out)
+            SELECTED["done"] = True
+            ACTIVE_CHARACTER["soid"] = NEW_CHARACTER_SOID
             return head + _pack_bits(bits)
         if msg == INVESTMENT_402 and len(body) >= 11:
+            # 402 = item action: presence bit | u64 SOID | presence bit | 15-bit content index | ... | action.
+            # The trailing value is 0 for a dismantle and non-zero (5 seen) for using a consumable.
             bits = int.from_bytes(body[2:11], "big")
-            dismantle_item((bits >> 7) & ((1 << 64) - 1))
+            soid = (bits >> 7) & ((1 << 64) - 1)
+            if len(body) >= 16 and body[15]:
+                consume_item(soid)
+            else:
+                dismantle_item(soid)
             return head + INVESTMENT_ZERO_COMPOSITE_BODY
         if msg == INVESTMENT_403 and len(body) >= 10:
             equip_item(struct.unpack(">Q", body[2:10])[0])
             return head + INVESTMENT_ZERO_COMPOSITE_BODY
         if msg == INVESTMENT_801 and len(body) >= 11:
             select_talent_node(struct.unpack(">Q", body[2:10])[0], body[10] - 0x80)
+            return head + INVESTMENT_ZERO_COMPOSITE_BODY
+        if msg == 701 and len(body) > 2:
+            try:
+                store_settings_701(bytes(body[2:]))
+            except Exception:
+                pass   # an undecodable body must not cost the reply
             return head + INVESTMENT_ZERO_COMPOSITE_BODY
         if msg in INVESTMENT_ZERO_COMPOSITE_IDS:
             return head + INVESTMENT_ZERO_COMPOSITE_BODY
@@ -442,6 +490,14 @@ def pushes_after(pt: bytes, account_soid: int = 0xD100000000000001) -> list[tupl
             out.append((TYPE_QUEUEZ_OBJECT, family_body(0, account_soid, FAMILY_VERSIONS[0], QUEUEZ_FLAG_DELTA,
                                                          family_objects(0, account_soid))))
         return out
+    if (t == TYPE_WORLD_SERVER_REQUEST and len(body) >= 2 and struct.unpack(">H", body[:2])[0] == INVESTMENT_504
+            and not AUTOSELECT and not SELECTED["done"]):
+        # the user picked a character: re-state the account with field 3 (the profile) so sign-in continues
+        # (answered with only the result composite, the client waits on a black screen)
+        SELECTED["done"] = True
+        ACTIVE_CHARACTER["soid"] = struct.unpack(">Q", body[2:10])[0] if len(body) >= 10 else None
+        return [(TYPE_QUEUEZ_OBJECT, family4_inventory_delta(account_soid) if ITEMS or PROGRESSIONS
+                 else family4_character_delta(account_soid))]
     if (t == TYPE_WORLD_SERVER_REQUEST and len(body) >= 2 and struct.unpack(">H", body[:2])[0] == INVESTMENT_501
             and CHARACTERS and not FAMILY4_STATE["pushed_character"]):
         FAMILY4_STATE["pushed_character"] = True
@@ -530,7 +586,8 @@ def profile_rsat(profile_soid: int) -> bytes:
 def account_rsat(account_soid: int, characters: list[int], profile_soid: int) -> bytes:
     """Account with its character list and field 3 = profile SOID (sibling account_rsat; PS3 has
     26 fields, so 22 trailing absent bits instead of PS4's 21)."""
-    if UNLOCK_FLAGS or ACCOUNT_DENSE or ACCOUNT_DENSE10:   # field 12 sparse {u64, flags {u7 n; 64 x flag}, values}; 14 dense
+    if UNLOCK_FLAGS or ACCOUNT_DENSE or ACCOUNT_DENSE10 or SETTINGS["account5"] is not None or not AUTOSELECT:
+        # field 12 sparse {u64, flags {u7 n; 64 x flag}, values}; 14 dense; 5 the display settings (701)
         import rsat
         values = {0: account_soid, 1: {0: len(characters), 1: list(characters)}, 3: profile_soid,
                   12: {1: {0: len(UNLOCK_FLAGS), 1: [{0: i, 1: UNLOCK_OWNED_RAW} for i in UNLOCK_FLAGS]},
@@ -547,6 +604,10 @@ def account_rsat(account_soid: int, characters: list[int], profile_soid: int) ->
                     if it.get("qty") is not None:
                         slots[it["slot"]][2] = it["qty"]
             values[6] = {0: ACCOUNT_SLOTS, 1: slots}
+        if SETTINGS["account5"] is not None:
+            values[5] = SETTINGS["account5"]
+        if not AUTOSELECT and not SELECTED["done"]:
+            values.pop(3, None)
         return rsat.encode(0x808018C7, values)
     bits = _character_list_bits(account_soid, characters) + [0]
     bits += [1] + [(profile_soid >> i) & 1 for i in reversed(range(64))]
@@ -584,20 +645,179 @@ PEER_CONTACT_TAG, DIRECTORY_CONTACT_TAG, DIRECTORY_CARD_TAG = 0x80801921, 0x8080
 FAMILY_VERSIONS = {0: 0, 2: 0}
 
 
+def _load_gear_index(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "private",
+                                       "item_gear_index.tsv")):
+    """ci -> gear-table index for equipment summary [2]; empty (all -1) when the file is absent."""
+    out = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                f = line.split("\t")
+                try:
+                    if f[0].isdigit():
+                        out[int(f[0])] = int(f[1])
+                except (ValueError, IndexError):
+                    continue   # a malformed line must not stop the server
+    except OSError:
+        pass
+    return out
+
+
+GEAR_INDEX = _load_gear_index()
+
+
+def _load_item_stats(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "private",
+                                       "item_stats.tsv")):
+    """ci -> [(stat key, value)] (tools/item_stats.py); empty when the file is absent."""
+    out = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                f = line.rstrip("\n").split("\t")
+                try:
+                    if f[0].isdigit() and len(f) > 1 and f[1]:
+                        out[int(f[0])] = [tuple(int(x) for x in p.split(":")) for p in f[1].split(",")]
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+ITEM_STATS = _load_item_stats()
+WEAPON_ORDINALS = (6, 7, 8)   # primary, special, heavy -> peer view [9..11] perks, [13..15] stats
+STAT_SLOTS = 16
+
+
+def _weapon_stats(ci: int) -> list:
+    """16 x {i8 key, i32 value} for peer view [13..15]; unused entries key -1 (same sentinel as [12])."""
+    pairs = ITEM_STATS.get(ci, [])[:STAT_SLOTS]
+    return [{0: k, 1: v} for k, v in pairs] + [{0: -1} for _ in range(STAT_SLOTS - len(pairs))]
+
+
+NULL_HASH = 0x811C9DC5
+ABILITY_BLOCKS = None   # peer view [4] when set: list of 5 {0: i8 selector, 1: [16 hashes]}
+
+# Per-class abilities: a table generated from the packages
+# (tools/gen_subclass_table.py) gives each subclass its base [4] rows (grenade, super, melee, jump, sprint) and the
+# modifier hash each talent node unlocks. The subclass is the equipped subclass item when it matches the character's
+# class, else the class's starting subclass. Unlocked node hashes go into [5] unless the table names one block.
+SUBCLASS_TABLE = None
+CLASS_NAMES = {0: "Titan", 1: "Hunter", 2: "Warlock"}
+START_SUBCLASS = {"Titan": "Striker", "Hunter": "Gunslinger", "Warlock": "Voidwalker"}
+SUBCLASS_ORDINAL = 0          # equipment ordinal of the subclass item (recipe 710@40e0)
+ACTIVE_CHARACTER = {"soid": None}   # set by investment 504 (character selected)
+
+
+def load_subclass_table(path: str) -> None:
+    import json
+    global SUBCLASS_TABLE
+    SUBCLASS_TABLE = json.load(open(path))["subclasses"]
+
+
+def _character_class() -> str | None:
+    soid = ACTIVE_CHARACTER["soid"] or (CHARACTERS[0] if CHARACTERS else None)
+    if soid is None:
+        return None
+    return CLASS_NAMES.get(CHARACTER_IDENTITY.get(soid, (0, 0, 0))[2])
+
+
+def subclass_ability_blocks():
+    """([4] blocks, [5] hashes) for the active character from SUBCLASS_TABLE, or None."""
+    cls = _character_class()
+    if not SUBCLASS_TABLE or cls is None:
+        return None
+    entry, states = None, []
+    it = next((i for i in ITEMS if i["equipped"] == SUBCLASS_ORDINAL), None)
+    if it is not None:
+        entry = next((e for e in SUBCLASS_TABLE.values()
+                      if e["item"]["ci"] == it["ci"] and e["class_name"] == cls), None)
+        if entry is not None:
+            states = ITEM_NODES.get(it["soid"], [])
+    if entry is None:
+        entry = SUBCLASS_TABLE.get(START_SUBCLASS.get(cls, ""))
+    if entry is None:
+        return None
+    base = entry["base_blocks"]
+    blocks = [{0: row, 1: [NULL_HASH] * 16} for row in base]
+    per, shared = {}, []
+    for n, state in enumerate(states):
+        if not state:
+            continue
+        for h, rows in entry["nodes"].get(str(n), ()):
+            h = int(h, 16) if isinstance(h, str) else h
+            if len(rows) == 1 and rows[0] in base:
+                per.setdefault(base.index(rows[0]), []).append(h)
+            else:
+                shared.append(h)   # [5] is offered to all five blocks; non-perks of a block are dropped
+    for b, hs in per.items():
+        hs = hs[:16]
+        blocks[b][1] = hs + [NULL_HASH] * (16 - len(hs))
+    return blocks, shared[:32]
+
+
+def set_ability_blocks(spec: str) -> None:
+    """'0,2,14' or '0.811c9dc5.1234abcd,-1,...': up to 5 blocks of selector + up to 16 hex hashes."""
+    blocks = []
+    for part in spec.split(",")[:5]:
+        f = [x for x in part.split(".") if x]
+        hashes = [int(h, 16) for h in f[1:17]]
+        blocks.append({0: int(f[0]) if f else -1, 1: hashes + [NULL_HASH] * (16 - len(hashes))})
+    blocks += [{0: -1, 1: [NULL_HASH] * 16} for _ in range(5 - len(blocks))]
+    global ABILITY_BLOCKS
+    ABILITY_BLOCKS = blocks
+
+
 def appearance_block(level: int, light: int, emblem: int | None) -> dict:
     equipment = [{1: -1, 3: -1} for _ in range(20)]
     if emblem is not None:
         equipment[EMBLEM_SLOT] = {1: emblem, 3: -1}
     for it in ITEMS:   # equipped inventory mirrors into the summary at its ordinal
         if it["equipped"] is not None:
-            entry = {0: it["soid"], 1: it["ci"], 3: -1}
+            # [2] (i16 @+10) is the in-world loadout's index into the 142-entry gear table (record
+            # 0x80a5f22d, read by 0x71e2a0 -> 0x2a66dc -> weapon blueprint); -1 = no blueprint, no weapon
+            # sobject. Values from GEAR_INDEX (private/item_gear_index.tsv, generated from your own dump by setup.py).
+            entry = {0: it["soid"], 1: it["ci"], 2: GEAR_INDEX.get(it["ci"], -1), 3: -1}
             if ITEM_ART:   # [3] art arrangement, [5] 6 x {i8 channel, i16 dye} (tools/item_art.py)
                 entry[3] = art_arrangement(it["ci"])
                 if ART_DYES:
                     entry[5] = item_dyes(it["ci"])
             equipment[it["equipped"]] = entry
     stats = [{0: 0, 1: light}] + [{0: -1} for _ in range(15)]
-    return {0: level, 2: float(level), 6: equipment, 12: stats}
+    block = {0: level, 2: float(level), 6: equipment, 12: stats}
+    # [13]/[14]/[15]: per equipped weapon (primary/special/heavy) its base stats; the in-world loadout reads
+    # them at player+0x840+0xB50/+0xBD0/+0xC50 (0x71E2A0). Absent, the gun runs on bare defaults (Fatebringer
+    # 3-round magazine). Perks [9..11] are not served yet.
+    for field, ordinal in zip((13, 14, 15), WEAPON_ORDINALS):
+        it = next((i for i in ITEMS if i["equipped"] == ordinal), None)
+        if it is not None and it["ci"] in ITEM_STATS:
+            block[field] = _weapon_stats(it["ci"])
+    if ABILITY_BLOCKS:   # [4] 5 x {i8 selector, 16 hashes}: the in-world loadout builder 0x71f86c turns them
+        block[4] = ABILITY_BLOCKS   # into the ability config bind_base_abilities (0x493e38) reads
+    elif SUBCLASS_TABLE:
+        ab = subclass_ability_blocks()
+        if ab:
+            block[4], five = ab
+            if five:   # [5]: 32 shared modifier hashes, offered to every block
+                block[5] = five + [NULL_HASH] * (32 - len(five))
+    if ACTIVE_PERKS:   # [8] character perks (consumable effects), -1 = empty
+        perks = sorted(ACTIVE_PERKS)[:32]
+        block[8] = perks + [-1] * (32 - len(perks))
+    return block
+
+
+def timed_pushes(account_soid: int = 0xD100000000000001) -> list[tuple[int, bytes]]:
+    """Family-0 re-statement once consumable perks are due for removal (see CONSUMABLE_PERKS)."""
+    import time
+    now = time.monotonic()
+    due = [p for p, t in ACTIVE_PERKS.items() if now >= t]
+    if not due or not SERVE_PEER:
+        return []
+    for p in due:
+        del ACTIVE_PERKS[p]
+    FAMILY_VERSIONS[0] += 1
+    return [(TYPE_QUEUEZ_OBJECT, family_body(0, account_soid, FAMILY_VERSIONS[0], QUEUEZ_FLAG_DELTA,
+                                             family_objects(0, account_soid)))]
 
 
 def _trailer(emblem: int | None) -> dict:
@@ -705,6 +925,20 @@ ART_DYES = False            # also fill appearance equipment [5]
 ITEM_GRID = {}
 ITEM_GRIDS = None
 ITEM_NODES = {}             # soid -> 36 node states (0 = not unlocked, k = k-th step), set by 801
+
+
+def preset_item_nodes(spec: str) -> None:
+    """'710=0.9.12,2221=1' -> node states 1 (first step active) for the listed nodes of every item with that ci.
+    Abilities are talent nodes of the subclass item: Striker (710, grid 132, manifest grid 4027063972) node 0 Lift,
+    9 Punch, 10 Storm Fist, 12 Sprint, 15 Flashbang, 20 Fist of Havoc; exclusive sets {1,15,16} {2,11,23}
+    {3,17,18} {4,5,6} {7,8,22} {13,14,21} {19,25,27} {26,28,29}. Node order matches the D1 manifest."""
+    for tok in (t for t in spec.split(",") if t):
+        ci, _, nodes = tok.partition("=")
+        for it in ITEMS:
+            if it["ci"] == int(ci):
+                states = ITEM_NODES.setdefault(it["soid"], [0] * 36)
+                for n in (int(x) for x in nodes.split(".") if x):
+                    states[n] = 1
 
 
 def select_talent_node(soid: int, node: int) -> None:
@@ -908,6 +1142,32 @@ def equip_item(soid: int) -> None:
         if it["equipped"] == ordinal:
             it["equipped"] = None
     item["equipped"] = ordinal
+
+
+# Consumable effects = character perks in peer view 0x80801855 [8] (32 x i16 indexes into the investment perk
+# table 012f/4654, resolved by 0x71f86c -> 0x2a6954 -> perk manager 0x4eafbc).
+# Ammo synthesis perks: one type-14 effect (add reserve = fraction x room, f32 per slot), a 0.1 s activation timer,
+# no lifetime. A perk fires once when it appears in [8]; it is removed again by a later family-0 push
+# (timed_pushes) so that the next use can re-add it.
+CONSUMABLE_PERKS = {714: 152, 716: 153, 718: 154}   # ci -> perk index: heavy / primary / special synthesis
+ACTIVE_PERKS: dict[int, float] = {}                  # perk index -> monotonic removal time
+PERK_HOLD_S = 3.0
+
+
+def consume_item(soid: int) -> None:
+    """Investment 402 with a non-zero action (consumable use): one off the stack; the slot empties at 0.
+    A consumable with a known perk (CONSUMABLE_PERKS) also activates it through peer view [8]."""
+    import time
+    for it in ITEMS:
+        if it["soid"] == soid:
+            perk = CONSUMABLE_PERKS.get(it["ci"])
+            if perk is not None:
+                ACTIVE_PERKS[perk] = time.monotonic() + PERK_HOLD_S
+            if (it.get("qty") or 1) > 1:
+                it["qty"] -= 1
+            else:
+                dismantle_item(soid)
+            return
 
 
 def dismantle_item(soid: int) -> None:

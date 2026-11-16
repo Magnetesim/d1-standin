@@ -13,13 +13,14 @@ it is not found, which also catches a wrong game version. Only update 01.24 is s
 usage: python3 setup.py            (needs the openssl command line tool and private/EBOOT.elf)
        D1_DISC_PACKAGES=/path/to/PS3_GAME/USRDIR/packages python3 setup.py     to also build the manifest
 """
-import os
+import glob, os
 import re
 import struct
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "tools"))
 OUT = os.path.join(HERE, "private")
 ROOT_NAME = "Tiger Root Authority"   # subject of the root certificate the title embeds for its sign-on host
 PATCH = '''Version: 1.2
@@ -77,6 +78,61 @@ def find_root_slot(elf_path):
     sys.exit(f"no '{ROOT_NAME}' certificate in {elf_path}: is this the 01.24 executable?")
 
 
+def link_disc_packages(disc):
+    """Sound needs the disc's packages next to the installed ones. The game streams audio (weapons, abilities,
+    impacts, music, much of the UI) only from packages it finds in its installed package folder on the hard drive;
+    the disc-only *_0.pkg files are skipped, so those sounds are silent. On a console the game's install step puts
+    them there. Here each missing disc package is symlinked into the installed folder (no copy); boot the game
+    fresh afterwards. Remove the links listed in the folder's .disc_links.txt to undo."""
+    from build_manifest import PKG
+    added = []
+    for f in sorted(glob.glob(glob.escape(disc) + "/*.pkg")):
+        dst = os.path.join(PKG, os.path.basename(f))
+        if not os.path.lexists(dst):
+            os.symlink(os.path.abspath(f), dst)
+            added.append(os.path.basename(f))
+    if added:
+        with open(os.path.join(PKG, ".disc_links.txt"), "a") as fh:
+            fh.write("".join(n + "\n" for n in added))
+    print(f"sound: linked {len(added)} disc packages into {PKG}")
+
+
+def generate_game_data():
+    """Tables the server needs, read from YOUR installed packages (nothing game-derived ships with this repo):
+    activities (names, checksums, areas, spawn lists), weapon models and stats, item appearance, subclass abilities.
+    Package blocks are Oodle LZH; tools/pkg_extract.py picks the decoder (the open-source oodle-lzh command if
+    installed, else a DLL you supplied, else the bundled pure-Python decoder, which is slower)."""
+    import pkg_extract
+    print(f"game data: LZH decoder = {pkg_extract.backend()}"
+          + (" (pure Python: install oodle-lzh to make this step much faster, see the README)"
+             if pkg_extract.backend() == "python" else ""))
+    py, t = sys.executable, os.path.join(HERE, "tools")
+    # scenario records live only in the activity packages (stems with "_act"); scanning just those is ~5x faster
+    activities = [py, os.path.join(t, "activities.py"), "--stems", "_act", "--out", os.path.join(OUT, "activities.json"),
+                  "--starts", os.path.join(HERE, "config", "activity_starts.json")]
+    steps = [
+        ("activities", activities, None),
+        # spawn lists per activity (fixtures you captured yourself are kept), then activities again to link them
+        ("spawn lists", [py, os.path.join(t, "sensor_fixture.py"), "--all", OUT, "--keep"], None),
+        ("activity spawn links", activities, None),
+        ("weapon models", [py, os.path.join(t, "item_gear_index.py"), "-o",
+                           os.path.join(OUT, "item_gear_index.tsv")], None),
+        ("weapon stats", [py, os.path.join(t, "item_stats.py")], None),
+        ("item appearance", [py, os.path.join(t, "item_art.py")], os.path.join(OUT, "item_art.tsv")),
+        ("subclass abilities", [py, os.path.join(t, "subclass_table.py"),
+                                os.path.join(OUT, "subclass_abilities.json")], None),
+    ]
+    for name, cmd, stdout_path in steps:
+        if stdout_path:
+            with open(stdout_path, "w") as fh:
+                r = subprocess.run(cmd, stdout=fh, stderr=subprocess.PIPE, text=True)
+        else:
+            r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0:
+            sys.exit(f"game data: {name} failed:\n{r.stderr[-2000:]}")
+        print(f"game data: {name} ok")
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     elf = os.path.join(OUT, "EBOOT.elf")
@@ -107,6 +163,8 @@ def main():
         subprocess.run([sys.executable, os.path.join(HERE, "tools", "build_manifest_coherent.py"), manifest],
                        check=True, env=env)
         print("manifest:", manifest)
+        link_disc_packages(os.environ["D1_DISC_PACKAGES"])
+        generate_game_data()
     else:
         print("manifest: skipped (set D1_DISC_PACKAGES to your disc's PS3_GAME/USRDIR/packages and run again)")
 

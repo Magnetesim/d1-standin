@@ -94,6 +94,7 @@ _SELECTED = None
 FOLLOW_ACTIVITY = True   # --ah-activity-fixed: keep answering with the default activity whatever was launched
 ACTIVITIES_FILE = "private/activities.json"   # index -> {name, hash, [checksum, public_checksum, bubbles, sensor, start]}
 LOG = print
+EVENT = lambda msg: None   # readable one-line events (dwstun --console events)
 
 
 def select_activity(index: int) -> None:
@@ -129,6 +130,8 @@ def select_activity(index: int) -> None:
         PUBLIC_REGIONS.clear()
         PUBLIC_REGIONS.update(a["public"])
     SENSOR_AUTO = json.load(open(a["sensor"])) if a.get("sensor") and os.path.exists(a["sensor"]) else None
+    EVENT(f"activity: launching {a['name']}" + ("" if SENSOR_AUTO else
+          " - no spawn list for it, the game will stay on the loading screen"))
     LOG(f"   [ah] launched activity {index} = {a['name']}" + (
         f"; NOT KNOWN YET: {', '.join(missing)} - see tools/activity_records.py"
         if missing else "") + ("" if SENSOR_AUTO else "; no spawn fixture"))
@@ -184,7 +187,7 @@ def entity_slots_allocated(grant: bool = True) -> bytes:
     offline branch memsets the pool to 0xFF; sibling entity.rs); later ones grant nothing. Re-granting on the second
     state refresh marked index 0 free again while the player entity already held it, the body then got the same
     index, and deleting the corpse left the player entity with an unmapped index -> the in-world crash
-    (run sens1, PROJECT_LOG 2026-10-04)."""
+    seen while testing."""
     import rsat
     return rsat.encode(TAG_ENTITY_SLOTS, {0: [0xFFFFFFFF if grant else 0] * 384})
 
@@ -224,6 +227,8 @@ TRAVEL = True   # answer the client's bubble-travel request (udt 21) with a new 
 PUBLIC_ADDR = ("127.0.0.1", 3074)   # where the public AH's bdCommonAddr points (--public-ip, UDP)
 PUBLIC_MODE = 1   # --ah-public-mode: region record [2][1] (the client accepts 1 or 2; 1 = join the session of the blob)
 SENSOR_ROUTE = "all"   # --ah-sensor-route: which AH connection carries udt 5 with a public AH: all | first | public
+PUBLIC_SID_PER_REGION = True   # distinct carrier security id per public travel target
+PUBLIC_AH_PER_REGION = True    # distinct public AH id per public travel target too
 PUBLIC_AH = 0   # --ah-public ID: 64-bit public activity-host id for the region record (0 = private)
 
 
@@ -244,6 +249,26 @@ def replicate_membership(req: dict, payload: bytes | None = None) -> bytes:
         rsat.BOOL_BITS, rsat.FIELD_BIAS = saved, saved_bias
 
 
+def public_ah_for(region: int) -> int:
+    """The public AH id a public bubble's record names: the configured one for the start region, else its own id
+    (the client refuses a new public session on an AH id whose earlier connection it has closed, so a third
+    public bubble needs its own id). Low 16 bits = 0x100 | region, so it never collides with the private id or PUBLIC_AH."""
+    if not PUBLIC_AH or not PUBLIC_AH_PER_REGION or region == START_REGION:
+        return PUBLIC_AH
+    return (PUBLIC_AH & ~0xFFFF) | 0x100 | (region & 0xFF)
+
+
+def public_ah_for_sid(sid) -> int:
+    """The same id from a peer session's security id (A1..A8 = start region, else A1..A7 + region byte)."""
+    last = sid[-1] if isinstance(sid, (bytes, bytearray)) else sid & 0xFF
+    return PUBLIC_AH if last == 0xA8 or not PUBLIC_AH_PER_REGION else (PUBLIC_AH & ~0xFFFF) | 0x100 | last
+
+
+def is_public_ah(ah_id: int) -> bool:
+    return bool(PUBLIC_AH) and (ah_id == PUBLIC_AH or (
+        (ah_id & ~0xFFFF) == (PUBLIC_AH & ~0xFFFF) and (ah_id & 0xFF00) == 0x100))
+
+
 def _replicate_membership(req: dict) -> bytes:
     import rsat
     members = [{0: req[2], 1: {0: req[3]}, 2: 0}] + [{} for _ in range(19)]
@@ -261,9 +286,15 @@ def _replicate_membership(req: dict) -> bytes:
         import socket as _s
         ip, port = PUBLIC_ADDR
         ep = _s.inet_aton(ip) + port.to_bytes(2, "little")   # bdAddr: the port is little-endian (0x12e: 04 0c = 3076)
-        blob = (bytes(range(0xA1, 0xA9)) + ep + bytes.fromhex("00ff00ff0000") * 2 + ep + ep + b"\x02" + bytes(5)
+        # PUBLIC_SID_PER_REGION: a public travel target gets its own security id (last byte = region), so the client
+        # cannot match it to the session it is already in (the pending public session slot is only created for a
+        # new session; with one shared id, walking into a second public bubble never finished loading)
+        sid = bytes(range(0xA1, 0xA9))
+        if PUBLIC_SID_PER_REGION and SLICE_REGION != START_REGION:
+            sid = sid[:7] + bytes([SLICE_REGION & 0xFF])
+        blob = (sid + ep + bytes.fromhex("00ff00ff0000") * 2 + ep + ep + b"\x02" + bytes(5)
                 + bytes(range(0xB0, 0xC0)))
-        regions[0][4].update({3: {0: 78, 1: list(blob) + [0] * 18}, 4: PUBLIC_AH})
+        regions[0][4].update({3: {0: 78, 1: list(blob) + [0] * 18}, 4: public_ah_for(SLICE_REGION)})
         regions[0][2] = {1: PUBLIC_MODE, 2: -1}   # the client requests the join (A+138 bit 4) only with [2][1] == 1 (A+1177)
     pah = {0: regions + [{0: -1, 2: {2: -1}} for _ in range(40 - len(regions))], 3: list(req[2][0])}
     # each region record holds a bool ([3][0][i][2][3]); with 0-bit bools the message is 40 bits short and the client
@@ -362,6 +393,7 @@ class Session:
         self.req = None   # decoded join_request
         self.last_tx = None   # monotonic time of our last push once the state has been published
         self.refreshes, self.auto_at, self.auto_step = 0, None, 0
+        self.travel = (SLICE_REGION, SLICE_TOKEN)   # the region record this host last published
 
     def state(self) -> dict:
         """What a resumed connection needs (dwstun saves it with the channel counters)."""
@@ -397,7 +429,7 @@ class Session:
         return {UDT_JOIN_RESULT: lambda: join_result(self.join_payload),
                 UDT_ENTITY_SLOTS: self._entity_slots,
                 UDT_GLOBAL_ACTIVITY_STATE: lambda: global_activity_state(
-                    PUBLIC_CHECKSUM if PUBLIC_AH and getattr(self, "ah_id", AH_ID) == PUBLIC_AH else None),
+                    PUBLIC_CHECKSUM if is_public_ah(getattr(self, "ah_id", AH_ID)) else None),
                 UDT_REPLICATE_MEMBERSHIP: lambda: replicate_membership(self.req, self.join_payload)}[udt]()
 
     def replies(self, pt: bytes) -> list[bytes] | None:
@@ -450,18 +482,22 @@ class Session:
                 region = desired.get(0)
                 if region is not None and region >= 0:
                     token = state.get(2) if state.get(2) is not None else SLICE_TOKEN
-                    if (region, token) != (SLICE_REGION, SLICE_TOKEN) and (
+                    # per host: the client sends the request to every AH it is on, and a host that already answered
+                    # globally must not leave the other one silent (Steppes -> Mothyards, both public,
+                    # only one host answered and the load never finished)
+                    if getattr(self, "travel", None) != (region, token) and (
                             region not in PUBLIC_REGIONS or PUBLIC_AH):
                         global MEMBERSHIP_ID
                         MEMBERSHIP_ID += 1
                         SLICE_REGION, SLICE_TOKEN = region, token
                         self.travel = (region, token)
+                        EVENT(f"activity: travel to area {region // 8}" + (" (public)" if region in PUBLIC_REGIONS else ""))
                         return [self.push(UDT_REPLICATE_MEMBERSHIP, self.build(UDT_REPLICATE_MEMBERSHIP))]
                 return []
         return None
 
     def _routed(self) -> bool:
-        mine_public = getattr(self, "ah_id", AH_ID) == PUBLIC_AH
+        mine_public = is_public_ah(getattr(self, "ah_id", AH_ID))
         return SENSOR_ROUTE == "all" or not PUBLIC_AH or (SENSOR_ROUTE == "public") == mine_public
 
     def sensor_due(self, path: str | None) -> bytes | None:
@@ -499,6 +535,7 @@ class Session:
                 init=c.get("regions", {}).get(str(START_REGION), c.get("init")))))
         elif self.auto_step == 1 and now >= self.auto_at + 3:
             self.auto_step = 2
+            EVENT(f"activity: spawning the player (area {START_REGION // 8})")
             slot = dict(c["slot"], tag=0x808022A5, second=True,
                         value={0: {0: -1, 1: FNV_EMPTY, 2: 1}, 2: {0: self.req[2][3]}})
             out.append(self.push(UDT_SENSOR_AUTH_UPDATE, sensor_auth_update(
