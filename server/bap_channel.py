@@ -62,6 +62,7 @@ INVESTMENT_ZERO_COMPOSITE_IDS = {104, 502, 504, 505, 506, 701, 702}
 # served account (tick 0x2aabcc memcmps it). Captured here and served back as account field 5, the first-run screens
 # are skipped on the next sign-in. SETTINGS_FILE persists the raw argument bits.
 SETTINGS = {"account5": None}
+SETTINGS_REPLAY = False   # serve the stored 701 bits back as account field 5 (see account_rsat)
 SETTINGS_FILE = None
 # Character select: account field 3 (the profile SOID) makes the client pre-select the character and continue
 # (0x2afeec). AUTOSELECT = False leaves it out so the select screen waits.
@@ -504,6 +505,10 @@ def pushes_after(pt: bytes, account_soid: int = 0xD100000000000001) -> list[tupl
         return [(TYPE_QUEUEZ_OBJECT, family4_character_delta(account_soid))]
     if t == TYPE_SUBSCRIPTION_REQUEST and len(body) == 9:
         family, root = body[0], struct.unpack(">Q", body[1:9])[0]
+        if family in FAMILY_VERSIONS:
+            # a (re)subscription gets a version-0 baseline, so the next delta must be version 1 again; a stale
+            # count (a second sign-in in the same server session) makes the client drop the connection (PORPOISE)
+            FAMILY_VERSIONS[family] = 0
         if family in EMPTY_FAMILIES and SERVE_PEER:
             return [(TYPE_QUEUEZ_OBJECT, family_body(family, root, 0, QUEUEZ_FLAG_BASELINE,
                                                      family_objects(family, root)))]
@@ -604,7 +609,11 @@ def account_rsat(account_soid: int, characters: list[int], profile_soid: int) ->
                     if it.get("qty") is not None:
                         slots[it["slot"]][2] = it["qty"]
             values[6] = {0: ACCOUNT_SLOTS, 1: slots}
-        if SETTINGS["account5"] is not None:
+        if SETTINGS["account5"] is not None and SETTINGS_REPLAY:
+            # Off by default: serving any account field 5 takes the client off its first-run path, and on that path a
+            # base-game account gets Moon/Venus/Mars "Requirements Not Met" + the Taken King offer (runs planetcold1-4,
+            # 2026-11-18/19: whole blob, the clean blob and the display-settings half alone all lock; no field 5 =
+            # first-run announcements every login, all destinations open). The settings are still stored.
             values[5] = SETTINGS["account5"]
         if not AUTOSELECT and not SELECTED["done"]:
             values.pop(3, None)

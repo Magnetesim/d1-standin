@@ -2,6 +2,11 @@
 # Starts the stand-in server. Start it (and listeners.sh) BEFORE RPCS3: it must own its ports first.
 # usage: ./run.sh [extra dwstun.py arguments]     (later arguments override the ones below)
 #        ./run.sh --console full                   every frame on the console, not just the events
+#        ./run.sh --keep-settings                  keep your in-game settings (screen bounds, brightness, button
+#                                                  layout) between sessions. Trade-off: the game then treats you as a
+#                                                  returning player, and Moon, Venus and Mars ask for The Taken King.
+#                                                  Without it every session starts like a first login (the
+#                                                  announcements, screen bounds) and all planets are open.
 # The console shows one line per event; the full log of every frame goes to private/logs/server-<time>.log.
 #
 # Files in private/ (never part of this repository):
@@ -12,8 +17,14 @@
 #     item_art.tsv           item appearance table
 #     subclass_abilities.json  per-class abilities
 #   ah_sensor_*.json     per-activity spawn lists (setup.py, from your packages)
-#   settings.json        your display settings (written by the server)
+#   settings.json        your in-game settings (written by the server; read back only with --keep-settings)
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
+keep=()
+rest=()
+for a in "$@"; do
+    if [[ $a == --keep-settings ]]; then keep=(--bap-settings-replay); else rest+=("$a"); fi
+done
+set -- "${rest[@]}"
 [[ -f private/EBOOT.elf ]] || { echo "missing private/EBOOT.elf" >&2; exit 1; }
 # the title binds UDP port 1001; Linux reserves ports below 1024 unless this is lowered (otherwise: CANARY at once)
 start=$(sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null || echo 0)
@@ -56,4 +67,4 @@ if [[ -s private/state.json ]]; then cp private/state.json private/account.json;
 args+=(--ah-listen 3076 --bap-ah-proxy 127.0.0.1:3076 --ah-start 56 --ah-public 0xd1a0000000000002
        --peer-host player,time,ah,reflect --ah-sensor-route first)
 
-exec python3 -u server/dwstun.py "${args[@]}" "$@"
+exec python3 -u server/dwstun.py "${args[@]}" "${keep[@]}" "$@"

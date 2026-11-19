@@ -5,7 +5,9 @@ block record 0x20 = {u32 file_offset, u32 stored_size, u16 gen, u16 flags, u8 sh
 The bytes live in the generation `gen` file of the same stem.
 usage: pkg_verify.py <glob-or-stem>...   (stems resolved under the installed packages dir)"""
 import glob, hashlib, os, re, struct, sys
-PKG = os.path.expanduser("~/.config/rpcs3/dev_hdd0/game/BLUS31181/USRDIR/a0000001/packages")
+# RPCS3's own folder (setup.py sets D1_RPCS3_DIR when it is not ~/.config/rpcs3, e.g. the Flatpak build)
+PKG = os.path.join(os.environ.get("D1_RPCS3_DIR") or os.path.expanduser("~/.config/rpcs3"),
+                   "dev_hdd0/game/BLUS31181/USRDIR/a0000001/packages")
 DISC = os.environ.get("D1_DISC_PACKAGES", os.path.join(os.path.dirname(os.path.abspath(__file__)), "../game/PS3_GAME/USRDIR/packages"))
 def locate(stem, gen):
     for d in (PKG, DISC):

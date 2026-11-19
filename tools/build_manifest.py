@@ -11,8 +11,9 @@ Exit: writes local/tls/manifest-powered.bin and prints a summary.
 """
 import os, struct, glob, sys
 
-PKG = os.path.expanduser(
-    "~/.config/rpcs3/dev_hdd0/game/BLUS31181/USRDIR/a0000001/packages")
+# RPCS3's own folder (setup.py sets D1_RPCS3_DIR when it is not ~/.config/rpcs3, e.g. the Flatpak build)
+PKG = os.path.join(os.environ.get("D1_RPCS3_DIR") or os.path.expanduser("~/.config/rpcs3"),
+                   "dev_hdd0/game/BLUS31181/USRDIR/a0000001/packages")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "local", "tls", "manifest-powered.bin")
 

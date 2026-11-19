@@ -11,7 +11,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 BLOCK = 0x40000
-PKGDIRS = [os.path.expanduser("~/.config/rpcs3/dev_hdd0/game/BLUS31181/USRDIR/a0000001/packages"),
+PKGDIRS = [os.path.join(os.environ.get("D1_RPCS3_DIR") or os.path.expanduser("~/.config/rpcs3"),
+                        "dev_hdd0/game/BLUS31181/USRDIR/a0000001/packages"),
            os.environ.get("D1_DISC_PACKAGES", str(REPO / "game/PS3_GAME/USRDIR/packages"))]
 
 # Package blocks are Oodle LZH. Decoders, in order of preference:
@@ -24,7 +25,8 @@ BRIDGE = Path(os.environ.get("D1_OODLE", str(DLLDIR / "liblinoodle3.so")))
 
 
 def _cli_path():
-    for c in (os.environ.get("D1_OODLE_LZH"), str(REPO / "private" / "oodle-lzh"), shutil.which("oodle-lzh")):
+    for c in (os.environ.get("D1_OODLE_LZH"), str(REPO / "private" / "oodle-lzh"), shutil.which("oodle-lzh"),
+              os.path.expanduser("~/.cargo/bin/oodle-lzh")):
         if c and os.path.isfile(c) and os.access(c, os.X_OK):
             return c
     return None

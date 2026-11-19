@@ -1,0 +1,50 @@
+Fix for the RPCS3 crash on entering The Divide (and other areas): the game binds an all-zero fragment program, and
+RPCS3's analyse_fragment_program scans past the zeroes into unrelated memory (vertex data), which then fails the
+shader decompiler (Verification failed / Unimplemented BEM / FP CAL). This stops the leading-zero scan after 256
+instructions and draws with an empty (NOP) program instead. Reported upstream: https://github.com/RPCS3/rpcs3/issues/19666
+
+Made against RPCS3 master 0ebb63697 (0.0.43-20623). Apply in an RPCS3 source checkout with:  git apply the-divide-fix.patch
+This patch is offered under RPCS3's own licence (GPL-2.0), so it can be used in RPCS3 builds.
+
+diff --git a/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp b/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp
+index 33613d4aa..e87b9519d 100644
+--- a/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp
++++ b/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp
+@@ -1000,6 +1000,15 @@ namespace rsx
+ 		auto data_ptr = vm::base(rsx::get_address(m_ctx, program_offset, program_location));
+ 		m_ctx->program.fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+ 
++		if (m_ctx->program.fp_metadata.is_nop_shader && m_ctx->program.fp_metadata.program_start_offset >= 256 * 16)
++		{
++			// The analyser found no opcode in the first 256 instructions (see analyse_fragment_program): use a single
++			// NOP + END instruction instead of the memory at the program address.
++			static const u8 s_nop_program[16] = { 0x00, 0x01 };
++			data_ptr = const_cast<u8*>(s_nop_program);
++			m_ctx->program.fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
++		}
++
+ 		m_ctx->program.fragment_program.data = (static_cast<u8*>(data_ptr) + m_ctx->program.fp_metadata.program_start_offset);
+ 		m_ctx->program.fragment_program.offset = program_offset + m_ctx->program.fp_metadata.program_start_offset;
+ 		m_ctx->program.fragment_program.ucode_length = m_ctx->program.fp_metadata.program_ucode_length;
+diff --git a/rpcs3/Emu/RSX/Program/ProgramStateCache.cpp b/rpcs3/Emu/RSX/Program/ProgramStateCache.cpp
+index 8d7501485..edb244fc9 100644
+--- a/rpcs3/Emu/RSX/Program/ProgramStateCache.cpp
++++ b/rpcs3/Emu/RSX/Program/ProgramStateCache.cpp
+@@ -472,6 +472,17 @@ fragment_program_utils::fragment_program_metadata fragment_program_utils::analys
+ 		}
+ 
+ 		index++;
++
++		if (index >= 256)
++		{
++			// Nothing but zeroes: the program pointer is at an empty (all-zero) region, e.g. local memory offset 0.
++			// Do not walk on into unrelated memory (vertex data decodes as garbage ucode and fails the decompiler).
++			// Report an empty program; the caller substitutes a NOP + END program.
++			result.program_start_offset = index * 16;
++			result.program_ucode_length = 16;
++			result.is_nop_shader = true;
++			return result;
++		}
+ 	}
+ 
+ 	while (true)

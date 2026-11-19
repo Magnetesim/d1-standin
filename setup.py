@@ -1,31 +1,54 @@
 #!/usr/bin/env python3
-"""One-time setup. Creates everything machine-specific under private/ (git-ignored):
+"""Setup, as a checklist. Each step checks whether it is already done, does it if it can, and otherwise stops with
+exactly what you need to do. Safe to run again at any time.
 
-  private/tls.key, private/tls.crt   a fresh self-signed certificate for the local sign-on listener
-  private/imported_patch.yml         the two game patches the title needs to talk to a local server
-  private/manifest.bin               the content manifest for YOUR installed packages
+usage: python3 setup.py --dump "/path/to/Destiny [BLUS31181]" --rpcs3 /path/to/rpcs3.AppImage
+       python3 setup.py               (later runs remember the paths; missing ones are asked for)
+       python3 setup.py --check       (only report what is done and what is missing)
+       python3 setup.py --yes         (answer every question with its default)
 
-Nothing here is shared between users: the certificate and its key are generated on your machine.
+What it does (all files it makes go to private/, which is never part of the repository):
+  RPCS3 and its firmware          found / checked (installing firmware stays with you, see the message)
+  your disc dump                  checked (a decrypted folder dump, e.g. from PS3 Disc Dumper)
+  update 01.24                    downloaded from Sony's update server and installed into RPCS3
+  the 01.24 executable            decrypted with RPCS3 (private/EBOOT.elf)
+  certificate + game patches      generated, installed into RPCS3 and enabled
+  per-game RPCS3 settings         network (RPCN, host redirects) and graphics settings the game needs
+  sound                           the disc's packages linked into the installed folder
+  content manifest + game data    built from your packages
+and it checks the two things only you can do: an RPCN account in RPCS3, and port 1001 (needs sudo).
 
-The place of the title's own root certificate is looked up in YOUR executable (private/EBOOT.elf); setup stops if
-it is not found, which also catches a wrong game version. Only update 01.24 is supported.
-
-usage: python3 setup.py            (needs the openssl command line tool and private/EBOOT.elf)
-       D1_DISC_PACKAGES=/path/to/PS3_GAME/USRDIR/packages python3 setup.py     to also build the manifest
+Setup never looks through your folders unless you say yes: RPCS3, RPCS3's own folder and your dump come from the
+command line, from the paths remembered in private/setup.json, or from a question that offers to look in the usual
+places. Before it changes anything in RPCS3's folder it lists the files and asks once (backups are kept).
 """
-import glob, os
+import argparse
+import glob
+import json
+import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "tools"))
 OUT = os.path.join(HERE, "private")
+STATE = os.path.join(OUT, "setup.json")
+TITLE = "BLUS31181"
 ROOT_NAME = "Tiger Root Authority"   # subject of the root certificate the title embeds for its sign-on host
+BUILD_0124 = b"51539.16.07.26.1808"   # the game's build string in the 01.24 executable (the disc has 41375.14.07.03.1501)
+PPU_HASH = "PPU-ac58999f254e8d9dc817426c8c84b068ee8caaea"   # RPCS3's id of the 01.24 executable (patch key)
+PATCH_NAMES = ("d1_standin_trust_local_certificate", "d1_standin_unsigned_content_manifest")
+UPDATE_LIST = f"https://a0.ww.np.dl.playstation.net/tpl/np/{TITLE}/{TITLE}-ver.xml"
+FIRMWARE_PAGE = "https://www.playstation.com/en-us/support/hardware/ps3/system-software/"
+RPCS3_PAGE = "https://rpcs3.net/download"
+OODLE_LZH = "https://github.com/Magnetesim/oodle-lzh"
 PATCH = '''Version: 1.2
 
-PPU-ac58999f254e8d9dc817426c8c84b068ee8caaea:
+%s:
   d1_standin_trust_local_certificate:
     Games:
       "Destiny":
@@ -50,6 +73,273 @@ PPU-ac58999f254e8d9dc817426c8c84b068ee8caaea:
     Patch:
       - [ be32, 0x18dca64, 0x00000000 ]
 '''
+# per-game RPCS3 settings: the network ones are required, the two graphics ones fix wrong colours and ghosting
+GAME_CONFIG = {
+    "Net": {"Internet enabled": "Connected", "PSN status": "RPCN"},
+    "Video": {"Write Color Buffers": "true", "Read Color Buffers": "true"},
+}
+
+
+class NeedsUser(Exception):
+    """A step only the user can do: the message says exactly what."""
+
+
+# --------------------------------------------------------------------------------------------------- small helpers
+def ask(question, default, args):
+    """[Y/n] or [y/N] question; --yes takes the default."""
+    if args.yes:
+        print(f"{question} [{'Y/n' if default else 'y/N'}] {'y' if default else 'n'} (--yes)")
+        return default
+    try:
+        a = input(f"{question} [{'Y/n' if default else 'y/N'}] ").strip().lower()
+    except EOFError:
+        return default
+    return default if not a else a.startswith("y")
+
+
+RPCS3_DIRS = ("~/.config/rpcs3", "~/.var/app/net.rpcs3.RPCS3/config/rpcs3")   # native, Flatpak
+RPCS3_FILES_CHANGED = ("patches/imported_patch.yml and patch_config.yml (adds the two d1_standin patches)",
+                       f"custom_configs/config_{TITLE}.yml (network + colour settings for this game only)",
+                       f"dev_hdd0/game/{TITLE}/ (installs the official updates, links the disc's packages)")
+
+
+def rpcs3_dir():
+    """RPCS3's own folder: settings, installed games, patches (chosen in step_rpcs3_dir)."""
+    d = os.environ.get("D1_RPCS3_DIR")
+    if d:
+        return d
+    raise NeedsUser("RPCS3's folder is not known yet (see the RPCS3 folder step)")
+
+
+def locate(st, args, key, what, explicit, valid, search, how):
+    """A path from the command line, then the remembered one, then - only if the user agrees - a search of the usual
+    places. `valid(path)` -> normalized path or None; `search()` -> candidate paths. Raises NeedsUser with `how`."""
+    for c in (explicit, st.get(key)):
+        v = valid(c) if c else None
+        if v:
+            st[key] = v
+            return v
+    if args.check:
+        raise NeedsUser(f"{what} not set yet. {how}")
+    if ask(f"{what} not set. Look for it in the usual places ({search.__doc__})?", False, args):
+        for c in search():
+            v = valid(c)
+            if v and ask(f"  found {v} - use it?", True, args):
+                st[key] = v
+                return v
+        print("  nothing (more) found there.")
+    raise NeedsUser(how)
+
+
+def rpcs3_log():
+    for d in (os.path.expanduser("~/.cache/rpcs3"), os.path.expanduser("~/.var/app/net.rpcs3.RPCS3/cache/rpcs3")):
+        if os.path.isdir(d):
+            return os.path.join(d, "RPCS3.log")
+    return os.path.expanduser("~/.cache/rpcs3/RPCS3.log")
+
+
+def game_dir():
+    return os.path.join(rpcs3_dir(), "dev_hdd0", "game", TITLE)
+
+
+def rpcs3_running():
+    return subprocess.run(["pgrep", "-x", "rpcs3"], capture_output=True).returncode == 0 or \
+        subprocess.run(["pgrep", "-f", r"[r]pcs3.*\.AppImage"], capture_output=True).returncode == 0
+
+
+def require_rpcs3_closed(what):
+    if rpcs3_running():
+        raise NeedsUser(f"close RPCS3 first ({what} changes RPCS3's own files, and RPCS3 rewrites them when it exits)")
+
+
+def sfo(path):
+    """PARAM.SFO -> {key: value}."""
+    b = open(path, "rb").read()
+    if b[:4] != b"\0PSF":
+        return {}
+    kt, dt, n = struct.unpack_from("<III", b, 8)
+    out = {}
+    for i in range(n):
+        ko, fmt, ln, _, do = struct.unpack_from("<HHIII", b, 20 + 16 * i)
+        key = b[kt + ko:b.index(b"\0", kt + ko)].decode()
+        raw = b[dt + do:dt + do + ln]
+        out[key] = struct.unpack("<I", raw)[0] if fmt == 0x0404 else raw.rstrip(b"\0").decode("utf-8", "replace")
+    return out
+
+
+# --------------------------------------------------------------------------------------------------- the steps
+def step_rpcs3(st, args):
+    """RPCS3 itself."""
+    def valid(c):
+        c = os.path.abspath(os.path.expanduser(c))
+        if not os.path.isfile(c):
+            return None
+        if not os.access(c, os.X_OK):
+            os.chmod(c, os.stat(c).st_mode | 0o111)
+        return c
+
+    def search():
+        """Downloads, Desktop, Applications, your home folder"""
+        found = [shutil.which("rpcs3")]
+        for pat in ("~/Downloads/*.AppImage", "~/Desktop/*.AppImage", "~/Applications/*.AppImage", "~/*.AppImage"):
+            found += sorted(glob.glob(os.path.expanduser(pat)), key=os.path.getmtime, reverse=True)
+        return [c for c in found if c and "rpcs3" in os.path.basename(c).lower()]
+
+    return locate(st, args, "rpcs3", "The RPCS3 program", args.rpcs3, valid, search,
+                  f"Download the Linux AppImage from {RPCS3_PAGE} (keep it anywhere), then run\n"
+                  f"    python3 setup.py --rpcs3 /path/to/rpcs3.AppImage")
+
+
+def step_rpcs3_dir(st, args):
+    """RPCS3's own folder (settings, firmware, installed games), and your OK to change files in it."""
+    def valid(c):
+        c = os.path.abspath(os.path.expanduser(c))
+        return c if os.path.isfile(os.path.join(c, "config.yml")) or os.path.isdir(os.path.join(c, "dev_hdd0")) \
+            else None
+
+    def search():
+        """~/.config/rpcs3, the Flatpak folder"""
+        return [os.path.expanduser(d) for d in RPCS3_DIRS]
+
+    d = locate(st, args, "rpcs3_dir", "RPCS3's folder", args.rpcs3_dir or os.environ.get("D1_RPCS3_DIR"), valid,
+               search, "Start RPCS3 once (it creates its folder), then run setup again, or pass\n"
+                       "    python3 setup.py --rpcs3-dir /path/to/rpcs3/folder   (the folder with config.yml)")
+    os.environ["D1_RPCS3_DIR"] = d   # the tools look for the game's packages there
+    if not st.get("rpcs3_dir_ok"):
+        if args.check:
+            raise NeedsUser(f"{d}: not yet allowed to change files there (run setup without --check)")
+        print(f"  Setup will change these in {d} (a backup *.before-d1-standin is kept of each edited file):")
+        for f in RPCS3_FILES_CHANGED:
+            print(f"    - {f}")
+        if not ask("  OK?", True, args):
+            raise NeedsUser("setup needs to change those files to make the game work with the stand-in")
+        st["rpcs3_dir_ok"] = True
+    return d
+
+
+def step_firmware(st, args):
+    """RPCS3 has run once and has the PS3 firmware installed."""
+    if not glob.glob(os.path.join(rpcs3_dir(), "dev_flash", "sys", "external", "*.sprx")):
+        raise NeedsUser(f"the PS3 firmware is not installed in RPCS3. Download PS3UPDAT.PUP from Sony\n"
+                        f"    ({FIRMWARE_PAGE}) and install it in RPCS3: File > Install Firmware.")
+    return rpcs3_dir()
+
+
+def step_dump(st, args):
+    """Your disc dump: a folder with PS3_GAME/ (decrypted, e.g. made with PS3 Disc Dumper)."""
+    if args.dump and args.dump.lower().endswith(".iso"):
+        raise NeedsUser("this needs the dump as a folder (PS3_GAME/ inside), not an ISO: extract the ISO first")
+
+    def valid(c):
+        c = os.path.abspath(os.path.expanduser(c))
+        if os.path.basename(c) == "PS3_GAME":
+            c = os.path.dirname(c)
+        param = os.path.join(c, "PS3_GAME", "PARAM.SFO")
+        return c if os.path.isfile(param) and sfo(param).get("TITLE_ID") == TITLE else None
+
+    def search():
+        """this folder, your home folder, Documents, Downloads - two levels deep"""
+        found = []
+        for root in (os.getcwd(), "~", "~/Documents", "~/Downloads", os.path.dirname(HERE)):
+            root = glob.escape(os.path.expanduser(root))
+            found += glob.glob(os.path.join(root, "*", "PS3_GAME")) + glob.glob(os.path.join(root, "*", "*", "PS3_GAME"))
+        return found
+
+    return locate(st, args, "dump", f"Your {TITLE} disc dump", args.dump, valid, search,
+                  f"Dump your disc as a folder (PS3 Disc Dumper does this and checks it against the disc's IRD),\n"
+                  f"    then run  python3 setup.py --dump \"/path/to/Destiny [{TITLE}]\"")
+
+
+def installed_version():
+    p = os.path.join(game_dir(), "PARAM.SFO")
+    return sfo(p).get("APP_VER") if os.path.isfile(p) else None
+
+
+def step_update(st, args):
+    """Update 01.24 installed in RPCS3 (12 packages from Sony's update server, 10.7 GB)."""
+    if installed_version() == "01.24":
+        return "01.24 installed"
+    if args.check:
+        raise NeedsUser(f"update 01.24 is not installed (installed: {installed_version() or 'none'})")
+    require_rpcs3_closed("installing the update")
+    import fetch_updates
+    folder = os.path.join(OUT, "updates")
+    pkgs = fetch_updates.fetch_manifest(TITLE)
+    have = [p for p in pkgs if fetch_updates.verified(os.path.join(folder, p["url"].rsplit("/", 1)[-1]), p)]
+    gb = sum(int(p["size"]) for p in pkgs if p not in have) / 2**30
+    if len(have) < len(pkgs) and not ask(f"Download the 01.24 update from Sony ({len(pkgs) - len(have)} packages, "
+                                         f"{gb:.1f} GB) into private/updates?", True, args):
+        raise NeedsUser("the update is required; run setup again when you want to download it")
+    if not fetch_updates.download(pkgs, folder):
+        raise NeedsUser("some downloads failed; run setup again to resume them")
+    print("installing the update into RPCS3, oldest first (RPCS3 opens and closes once per package)")
+    for p in sorted(pkgs, key=lambda p: [int(x) for x in p.get("version", "0").split(".")]):
+        if installed_version() and installed_version() >= p.get("version", ""):
+            continue
+        install_pkg(st["rpcs3"], os.path.join(folder, p["url"].rsplit("/", 1)[-1]))
+    if installed_version() != "01.24":
+        raise NeedsUser(f"the update did not install (installed: {installed_version()}); see {rpcs3_log()}")
+    if ask("Update installed. Delete the downloaded packages in private/updates (10.7 GB)?", False, args):
+        shutil.rmtree(folder, ignore_errors=True)
+    return "01.24 installed"
+
+
+def install_pkg(emu, pkg, timeout=1800):
+    """RPCS3 installs one package per launch, with its window open, then waits on a 'Success' box: watch its log
+    for the result and close it."""
+    name = os.path.basename(pkg)
+    log = rpcs3_log()
+    if os.path.exists(log):
+        os.remove(log)
+    proc = subprocess.Popen([emu, "--installpkg", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    t0, ok = time.time(), None
+    print(f"  {name} ...", end="", flush=True)
+    while time.time() - t0 < timeout:
+        text = open(log, errors="replace").read() if os.path.exists(log) else ""
+        if re.search(r"Successfully installed .*" + re.escape(name), text):
+            ok = True
+        elif "Failed to install" in text or "Package installation failed" in text:
+            ok = False
+        if ok is not None or proc.poll() is not None:
+            break
+        time.sleep(2)
+    proc.terminate()
+    try:
+        proc.wait(15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    print(f" {'ok' if ok else 'FAILED'} ({time.time() - t0:.0f} s)")
+    if not ok:
+        raise NeedsUser(f"installing {name} failed; see {log}")
+
+
+def step_eboot(st, args):
+    """The 01.24 executable, decrypted (private/EBOOT.elf)."""
+    elf = os.path.join(OUT, "EBOOT.elf")
+    if os.path.isfile(elf) and BUILD_0124 in open(elf, "rb").read():
+        return elf
+    if os.path.isfile(elf):
+        old = b"41375.14.07.03.1501" in open(elf, "rb").read()
+        print(f"  private/EBOOT.elf is not the 01.24 executable{' (it is the disc original)' if old else ''}; "
+              f"replacing it")
+    if args.check:
+        raise NeedsUser("private/EBOOT.elf (the decrypted 01.24 executable) is missing")
+    src = os.path.join(game_dir(), "USRDIR", "EBOOT.BIN")
+    if installed_version() != "01.24" or not os.path.isfile(src):
+        raise NeedsUser("install update 01.24 first")
+    require_rpcs3_closed("decrypting")
+    work = os.path.join(OUT, "decrypt")
+    os.makedirs(work, exist_ok=True)
+    shutil.copy(src, os.path.join(work, "EBOOT.BIN"))   # decrypt a copy: nothing is written into the game folder
+    subprocess.run([st["rpcs3"], "--decrypt", os.path.join(work, "EBOOT.BIN")], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=300)
+    made = os.path.join(work, "EBOOT.elf")
+    if not os.path.isfile(made) or BUILD_0124 not in open(made, "rb").read():
+        raise NeedsUser("RPCS3 could not decrypt the executable. In RPCS3: Utilities > Decrypt PS3 Binaries, pick\n"
+                        f"    {src}\n    and copy the EBOOT.elf it writes next to it to private/EBOOT.elf")
+    shutil.move(made, elf)
+    shutil.rmtree(work, ignore_errors=True)
+    return elf
 
 
 def find_root_slot(elf_path):
@@ -59,6 +349,8 @@ def find_root_slot(elf_path):
     b = open(elf_path, "rb").read()
     if b[:6] != b"\x7fELF\x02\x02":
         sys.exit(f"{elf_path} is not a decrypted PS3 executable (64-bit big-endian ELF expected)")
+    if BUILD_0124 not in b:
+        sys.exit(f"{elf_path} is not the 01.24 executable; delete it and run setup again")
     phoff, = struct.unpack_from(">Q", b, 0x20)
     phentsize, phnum = struct.unpack_from(">HH", b, 0x36)
     segments = []
@@ -78,34 +370,181 @@ def find_root_slot(elf_path):
     sys.exit(f"no '{ROOT_NAME}' certificate in {elf_path}: is this the 01.24 executable?")
 
 
-def link_disc_packages(disc):
-    """Sound needs the disc's packages next to the installed ones. The game streams audio (weapons, abilities,
-    impacts, music, much of the UI) only from packages it finds in its installed package folder on the hard drive;
-    the disc-only *_0.pkg files are skipped, so those sounds are silent. On a console the game's install step puts
-    them there. Here each missing disc package is symlinked into the installed folder (no copy); boot the game
-    fresh afterwards. Remove the links listed in the folder's .disc_links.txt to undo."""
+def step_certificate(st, args):
+    """A certificate made on this machine, and the two game patches that go with it (private/imported_patch.yml)."""
+    address, slot = find_root_slot(os.path.join(OUT, "EBOOT.elf"))
+    key, crt = os.path.join(OUT, "tls.key"), os.path.join(OUT, "tls.crt")
+    if not os.path.exists(crt):
+        if args.check:
+            raise NeedsUser("no certificate yet")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:1536", "-sha256", "-nodes", "-days", "3650",
+                        "-subj", "/CN=D1", "-keyout", key, "-out", crt,
+                        "-addext", "basicConstraints=critical,CA:TRUE",
+                        "-addext", "subjectAltName=DNS:*.signon.deadorbit.net,DNS:*.signon.gravityshavings.net"],
+                       check=True, stderr=subprocess.DEVNULL)
+        os.chmod(key, 0o600)
+    pem = open(crt).read()
+    if len(pem) > slot:
+        sys.exit(f"certificate is {len(pem)} bytes, the slot holds {slot}; delete private/tls.* and run again")
+    text = (pem + "\n" * (slot - len(pem))).replace("\n", "\\n")
+    patch, path = PATCH % (PPU_HASH, address, text), os.path.join(OUT, "imported_patch.yml")
+    if not os.path.exists(path) or open(path).read() != patch:
+        if args.check:
+            raise NeedsUser("the patch file is missing or out of date")
+        open(path, "w").write(patch)
+    return crt
+
+
+def _drop_blocks(lines, header_indent, names):
+    """Remove the YAML blocks `<indent>name:` (and everything indented deeper) for each name."""
+    out, skip = [], False
+    for ln in lines:
+        ind = len(ln) - len(ln.lstrip(" "))
+        if skip and (not ln.strip() or ind > header_indent):
+            continue
+        skip = False
+        if ind == header_indent and ln.strip().rstrip(":") in names:
+            skip = True
+            continue
+        out.append(ln)
+    return out
+
+
+def _put_under(lines, top, block):
+    """Insert block lines right after the top-level key `top:`, adding the key when it is missing."""
+    for i, ln in enumerate(lines):
+        if ln.rstrip() == f"{top}:":
+            return lines[:i + 1] + block + lines[i + 1:]
+    return lines + ([""] if lines and lines[-1].strip() else []) + [f"{top}:"] + block
+
+
+def step_patches(st, args):
+    """The two patches installed in RPCS3 and enabled (other patches you have are kept)."""
+    pdir = os.path.join(rpcs3_dir(), "patches")
+    imported, config = os.path.join(pdir, "imported_patch.yml"), os.path.join(rpcs3_dir(), "patch_config.yml")
+    ours = open(os.path.join(OUT, "imported_patch.yml")).read()
+    have = open(imported).read() if os.path.exists(imported) else ""
+    entries = ours.split(f"{PPU_HASH}:\n", 1)[1].rstrip("\n").split("\n")
+    enabled = os.path.exists(config) and all(
+        re.search(rf"^  {n}:\n    Destiny:\n      {TITLE}:\n        \"01.24\":\n          Enabled: true", open(config).read(),
+                  re.M) for n in PATCH_NAMES)
+    if "\n".join(entries) in have and enabled:
+        return "installed and enabled"
+    if args.check:
+        raise NeedsUser("the game patches are not installed/enabled in RPCS3 yet")
+    require_rpcs3_closed("installing the patches")
+    os.makedirs(pdir, exist_ok=True)
+    if have:
+        shutil.copy(imported, imported + ".before-d1-standin")
+        lines = _drop_blocks(have.rstrip("\n").split("\n"), 2, PATCH_NAMES)
+        if not any(ln.startswith("Version:") for ln in lines):
+            lines = ["Version: 1.2", ""] + lines
+        open(imported, "w").write("\n".join(_put_under(lines, PPU_HASH, entries)) + "\n")
+    else:
+        open(imported, "w").write(ours)
+    block = []
+    for n in PATCH_NAMES:
+        block += [f"  {n}:", "    Destiny:", f"      {TITLE}:", '        "01.24":', "          Enabled: true"]
+    cfg = open(config).read().rstrip("\n").split("\n") if os.path.exists(config) else []
+    if cfg:
+        shutil.copy(config, config + ".before-d1-standin")
+    cfg = _drop_blocks(cfg, 2, PATCH_NAMES)
+    open(config, "w").write("\n".join(_put_under(cfg, PPU_HASH, block)) + "\n")
+    return "installed and enabled (backups: *.before-d1-standin)"
+
+
+def step_game_config(st, args):
+    """RPCS3's settings for this game: network on, RPCN, the game's server names sent to this machine."""
+    path = os.path.join(rpcs3_dir(), "custom_configs", f"config_{TITLE}.yml")
+    swaps = open(os.path.join(HERE, "config", "ip_swap_list.txt")).read().strip()
+    want = {sec: dict(v) for sec, v in GAME_CONFIG.items()}
+    want["Net"]["IP swap list"] = swaps
+    text = open(path).read() if os.path.exists(path) else ""
+    missing = [f"{sec}/{k}" for sec, kv in want.items() for k, v in kv.items()
+               if not re.search(rf"^  {re.escape(k)}: {re.escape(v)}$", text, re.M)]
+    if not missing:
+        return path
+    if args.check:
+        raise NeedsUser(f"RPCS3's settings for the game are not set: {', '.join(missing)}")
+    require_rpcs3_closed("changing the game's settings")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if text:
+        shutil.copy(path, path + ".before-d1-standin")
+    lines = text.rstrip("\n").split("\n") if text else []
+    for sec, kv in want.items():
+        for k, v in kv.items():
+            pat = re.compile(rf"^  {re.escape(k)}:.*$")
+            idx = [i for i, ln in enumerate(lines) if pat.match(ln)]
+            if idx:
+                lines[idx[0]] = f"  {k}: {v}"
+            else:
+                lines = _put_under(lines, sec, [f"  {k}: {v}"])
+    open(path, "w").write("\n".join(lines) + "\n")
+    return path
+
+
+def step_sound(st, args):
+    """Sound: the disc's packages linked into the installed folder (the game streams audio only from there)."""
+    disc = os.path.join(st["dump"], "PS3_GAME", "USRDIR", "packages")
     from build_manifest import PKG
-    added = []
-    for f in sorted(glob.glob(glob.escape(disc) + "/*.pkg")):
-        dst = os.path.join(PKG, os.path.basename(f))
-        if not os.path.lexists(dst):
-            os.symlink(os.path.abspath(f), dst)
-            added.append(os.path.basename(f))
-    if added:
-        with open(os.path.join(PKG, ".disc_links.txt"), "a") as fh:
-            fh.write("".join(n + "\n" for n in added))
-    print(f"sound: linked {len(added)} disc packages into {PKG}")
+    missing = [f for f in glob.glob(glob.escape(disc) + "/*.pkg") if not os.path.lexists(os.path.join(PKG, os.path.basename(f)))]
+    if not missing:
+        return "disc packages linked"
+    if args.check:
+        raise NeedsUser(f"{len(missing)} disc packages are not linked yet")
+    with open(os.path.join(PKG, ".disc_links.txt"), "a") as fh:
+        for f in sorted(missing):
+            os.symlink(os.path.abspath(f), os.path.join(PKG, os.path.basename(f)))
+            fh.write(os.path.basename(f) + "\n")
+    return f"linked {len(missing)} disc packages (list: {os.path.join(PKG, '.disc_links.txt')})"
 
 
-def generate_game_data():
-    """Tables the server needs, read from YOUR installed packages (nothing game-derived ships with this repo):
-    activities (names, checksums, areas, spawn lists), weapon models and stats, item appearance, subclass abilities.
-    Package blocks are Oodle LZH; tools/pkg_extract.py picks the decoder (the open-source oodle-lzh command if
-    installed, else a DLL you supplied, else the bundled pure-Python decoder, which is slower)."""
+def step_manifest(st, args):
+    """The content manifest for your install (private/manifest.bin)."""
+    manifest = os.path.join(OUT, "manifest.bin")
+    if args.check:
+        if not os.path.exists(manifest):
+            raise NeedsUser("no content manifest yet")
+        return manifest
+    env = dict(os.environ, WITH_GEN0="1", D1_DISC_PACKAGES=os.path.join(st["dump"], "PS3_GAME", "USRDIR", "packages"))
+    subprocess.run([sys.executable, os.path.join(HERE, "tools", "build_manifest_coherent.py"), manifest],
+                   check=True, env=env, stdout=subprocess.DEVNULL)
+    return manifest
+
+
+def step_decoder(st, args):
+    """The package decoder: the fast oodle-lzh command, or the bundled (slow) Python one."""
     import pkg_extract
-    print(f"game data: LZH decoder = {pkg_extract.backend()}"
-          + (" (pure Python: install oodle-lzh to make this step much faster, see the README)"
-             if pkg_extract.backend() == "python" else ""))
+    pkg_extract.backend.cache_clear()
+    if pkg_extract.backend() != "python" or st.get("slow_decoder_ok"):
+        return pkg_extract.backend()
+    if args.check:
+        raise NeedsUser("the fast decoder (oodle-lzh) is not installed; setup would use the slow Python one")
+    if shutil.which("cargo") and ask(f"The fast package decoder (oodle-lzh) is not installed. Build it now with "
+                                     f"cargo (about a minute)?", True, args):
+        r = subprocess.run(["cargo", "install", "--git", OODLE_LZH, "oodle-lzh"])
+        pkg_extract.backend.cache_clear()
+        if r.returncode == 0 and pkg_extract.backend() == "cli":
+            return "cli (just built)"
+    if not ask("Fast decoder not found: continue with the slow Python decoder (about 7 minutes instead of 1)?",
+               False, args):
+        raise NeedsUser(f"install the fast decoder: {OODLE_LZH} (cargo install --git {OODLE_LZH}), "
+                        f"or put its binary at private/oodle-lzh, then run setup again")
+    st["slow_decoder_ok"] = True
+    return "python"
+
+
+def step_game_data(st, args):
+    """Tables the server needs, read from YOUR installed packages (nothing game-derived ships with this repo):
+    activities (names, checksums, areas, spawn lists), weapon models and stats, item appearance, subclass abilities."""
+    made = [os.path.join(OUT, f) for f in ("activities.json", "item_gear_index.tsv", "item_stats.tsv", "item_art.tsv",
+                                           "subclass_abilities.json")]
+    if args.check:
+        if not all(os.path.exists(f) for f in made):
+            raise NeedsUser("the game data has not been generated yet")
+        return "generated"
+    if all(os.path.exists(f) for f in made) and not args.regenerate:
+        return "generated earlier (--regenerate to redo)"
     py, t = sys.executable, os.path.join(HERE, "tools")
     # scenario records live only in the activity packages (stems with "_act"); scanning just those is ~5x faster
     activities = [py, os.path.join(t, "activities.py"), "--stems", "_act", "--out", os.path.join(OUT, "activities.json"),
@@ -123,50 +562,95 @@ def generate_game_data():
                                 os.path.join(OUT, "subclass_abilities.json")], None),
     ]
     for name, cmd, stdout_path in steps:
+        t0 = time.time()
+        print(f"  {name} ...", end="", flush=True)
         if stdout_path:
             with open(stdout_path, "w") as fh:
                 r = subprocess.run(cmd, stdout=fh, stderr=subprocess.PIPE, text=True)
         else:
             r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if r.returncode != 0:
-            sys.exit(f"game data: {name} failed:\n{r.stderr[-2000:]}")
-        print(f"game data: {name} ok")
+            sys.exit(f" failed:\n{r.stderr[-2000:]}")
+        print(f" ok ({time.time() - t0:.0f} s)")
+    return "generated"
+
+
+def step_rpcn(st, args):
+    """An RPCN account in RPCS3 (the game signs in to RPCN before it talks to this server)."""
+    p = os.path.join(rpcs3_dir(), "rpcn.yml")
+    text = open(p).read() if os.path.exists(p) else ""
+    m = re.search(r"^NPID: *(\S+)", text, re.M)
+    if m and re.search(r"^Token: *\S", text, re.M):
+        return f"account {m.group(1)}"
+    raise NeedsUser("set up an RPCN account in RPCS3: Configuration > RPCN (create one, enter the token it emails you)")
+
+
+def step_port(st, args):
+    """Port 1001 (the game binds it; Linux reserves ports below 1024)."""
+    try:
+        start = int(open("/proc/sys/net/ipv4/ip_unprivileged_port_start").read())
+    except OSError:
+        return "not Linux? skipped"
+    if start <= 1001:
+        return "allowed"
+    raise NeedsUser("before playing, allow port 1001 (until the next reboot):\n"
+                    "    sudo sysctl -w net.ipv4.ip_unprivileged_port_start=1001\n"
+                    "    or permanently: echo net.ipv4.ip_unprivileged_port_start=1001 | "
+                    "sudo tee /etc/sysctl.d/60-d1-standin.conf && sudo sysctl --system")
+
+
+STEPS = [   # (name, function, stops setup when it needs you)
+    ("RPCS3", step_rpcs3, True),
+    ("RPCS3 folder", step_rpcs3_dir, True),
+    ("RPCS3 firmware", step_firmware, True),
+    ("disc dump", step_dump, True),
+    ("update 01.24", step_update, True),
+    ("decrypted executable", step_eboot, True),
+    ("certificate + patch file", step_certificate, True),
+    ("patches in RPCS3", step_patches, True),
+    ("game settings in RPCS3", step_game_config, True),
+    ("sound (disc packages)", step_sound, True),
+    ("content manifest", step_manifest, True),
+    ("package decoder", step_decoder, True),
+    ("game data", step_game_data, True),
+    ("RPCN account", step_rpcn, False),
+    ("port 1001", step_port, False),
+]
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dump", help='your disc dump folder, e.g. "~/Games/Destiny [BLUS31181]"')
+    ap.add_argument("--rpcs3", help="the RPCS3 program (e.g. rpcs3-....AppImage)")
+    ap.add_argument("--rpcs3-dir", help="RPCS3's own folder (the one with config.yml; default ~/.config/rpcs3)")
+    ap.add_argument("--check", action="store_true", help="only report, change nothing")
+    ap.add_argument("--yes", action="store_true", help="answer every question with its default")
+    ap.add_argument("--regenerate", action="store_true", help="generate the game data again")
+    args = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
-    elf = os.path.join(OUT, "EBOOT.elf")
-    if not os.path.exists(elf):
-        sys.exit("put your decrypted 01.24 executable at private/EBOOT.elf first")
-    address, SLOT = find_root_slot(elf)
-    key, crt = os.path.join(OUT, "tls.key"), os.path.join(OUT, "tls.crt")
-    if not os.path.exists(crt):
-        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:1536", "-sha256", "-nodes", "-days", "3650",
-                        "-subj", "/CN=D1", "-keyout", key, "-out", crt,
-                        "-addext", "basicConstraints=critical,CA:TRUE",
-                        "-addext", "subjectAltName=DNS:*.signon.deadorbit.net,DNS:*.signon.gravityshavings.net"],
-                       check=True, stderr=subprocess.DEVNULL)
-        os.chmod(key, 0o600)
-        print("certificate:", crt)
-    pem = open(crt).read()
-    if len(pem) > SLOT:
-        sys.exit(f"certificate is {len(pem)} bytes, the slot holds {SLOT}; delete private/tls.* and run again")
-    text = (pem + "\n" * (SLOT - len(pem))).replace("\n", "\\n")
-    patch = os.path.join(OUT, "imported_patch.yml")
-    open(patch, "w").write(PATCH % (address, text))
-    print("game patches:", patch)
-    print("  copy it to ~/.config/rpcs3/patches/imported_patch.yml and enable both entries in RPCS3's Patch Manager")
-
-    if os.environ.get("D1_DISC_PACKAGES"):
-        manifest = os.path.join(OUT, "manifest.bin")
-        env = dict(os.environ, WITH_GEN0="1")
-        subprocess.run([sys.executable, os.path.join(HERE, "tools", "build_manifest_coherent.py"), manifest],
-                       check=True, env=env)
-        print("manifest:", manifest)
-        link_disc_packages(os.environ["D1_DISC_PACKAGES"])
-        generate_game_data()
+    st = json.load(open(STATE)) if os.path.exists(STATE) else {}
+    todo = []
+    for name, fn, blocking in STEPS:
+        try:
+            print(f"[ok]   {name}: {fn(st, args)}")
+        except NeedsUser as e:
+            print(f"[todo] {name}: {e}")
+            todo.append(name)
+            if blocking and not args.check:
+                break
+        except (KeyError, FileNotFoundError) as e:   # --check after a missing earlier step
+            print(f"[todo] {name}: needs an earlier step first ({e})")
+            todo.append(name)
+        finally:
+            json.dump(st, open(STATE, "w"), indent=1)
+    if not todo:
+        print("\nSetup is complete. Start ./listeners.sh and ./run.sh (each in its own terminal), then boot the game in "
+              "RPCS3.")
+    elif args.check:
+        print("\nRun setup without --check to do the missing steps.")
     else:
-        print("manifest: skipped (set D1_DISC_PACKAGES to your disc's PS3_GAME/USRDIR/packages and run again)")
+        print("\nDo the step above, then run python3 setup.py again; it continues where it stopped.")
+    sys.exit(1 if todo and todo[0] not in ("RPCN account", "port 1001") else 0)
 
 
 if __name__ == "__main__":

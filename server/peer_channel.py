@@ -183,10 +183,16 @@ class Channel:
                 idx += int(s[p:p + 4], 2) + 1; p += 4
             else:
                 idx += 1
+            # a header with no size/body after it (seen once, right after a bubble change: "01" + index 0 at the very
+            # end of the packet) or a truncated fragment: stop here instead of reading past the end
+            if p >= len(s) or (s[p] == "1" and p + 10 > len(s)):
+                break
             if s[p] == "0":
                 n = 256; p += 1
             else:
                 n = int(s[p + 2:p + 10], 2) + 1; p += 10
+            if p + n > len(s):
+                break
             if idx >= self.rx_next:
                 self.rx_frags.setdefault(idx, s[p:p + n])
             p += n

@@ -436,7 +436,14 @@ def build(act, verbose=False):
             terms.append((t, groups.get(g.hash) or g))     # the discovered object carries its entry index
     terms.sort(key=lambda x: getattr(x[1], "entry", 0))    # entry order = content build order
     pub_regions = sorted(b * 8 for b, p in enumerate(public) if p)
+    # more terminal groups than public bubbles (Venus: 7 for 6): the extras belong to other bubbles; live region 160
+    # of patrol_shat_com01 has the 6th group in content order, so the extras are taken from the front [one data point]
+    terms = terms[max(0, len(terms) - len(pub_regions)):]
     term_assign = {g.hash: pub_regions[i] for i, (_, g) in enumerate(terms) if i < len(pub_regions)}
+    # sightings named after the activity's own token (patrol_shat_com01 -> patrol_sighting_shat, _shat_1) are not a
+    # bubble's exact name (the bubble is shattered_coast); they belong to the activity's start bubble
+    act_tok = a["name"].split("_")[1] if a["name"].count("_") >= 1 else ""
+    start_region = a.get("start")
     bhash_set = set(bhashes)
     fx = {"gen": GEN, "hash": lg.hash, "sub": li, "phase": PHASE,
           "slot": {"hash": sg.hash, "i7": sg.types[si], "sub": si}, "regions": {}, "names": {}, "exits": {}}
@@ -467,10 +474,15 @@ def build(act, verbose=False):
                 if (g.hash, i) == (lg.hash, li):
                     continue
                 m = RACE.match(nm) or SIGHTING.match(nm)
-                if m and fnv1(m.group(1)) not in bhash_set:
+                own = bool(m and SIGHTING.match(nm) and act_tok and fnv1(m.group(1)) not in bhash_set and
+                           (m.group(1) == act_tok or m.group(1).startswith(act_tok + "_")))
+                if m and fnv1(m.group(1)) not in bhash_set and not own:
                     continue                     # dangling bubble name: not registered in this activity
                 tok = scoped_token(nm, i7)
-                if tok is not None and tok != want_tok:
+                if own:
+                    if region != start_region:
+                        continue
+                elif tok is not None and tok != want_tok:
                     continue
                 is_term = i7 == 4 and nm.endswith("._terminal")
                 if is_term and term_assign.get(g.hash) != region:
